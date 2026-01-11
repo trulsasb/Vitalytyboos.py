@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="UTF-8" />
+  <title>Vitality Boost Nettbutikk</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style id="dynamic-style">
+    /* Dynamisk stil settes via JS fra /api/config */
+  </style>
+</head>
+<body>
+  <header class="vb-header">
+    <div class="vb-header-main">
+      <div class="vb-logo" id="storeName">Vitality Boost</div>
+      <div class="vb-tagline">Premium kosttilskudd – gratis frakt, ingen abonnement</div>
+    </div>
+    <button class="vb-pill" id="mobileFocusBtn">Åpne i mobilvisning</button>
+  </header>
+
+  <main class="vb-main">
+    <section class="vb-hero">
+      <h1 id="heroTitle">Premium kosttilskudd – uten binding</h1>
+      <p id="heroSubtitle">
+        Velg produktene, legg inn e-post og betal trygt med kort eller Vipps. Det tar under 1 minutt.
+      </p>
+      <ul class="vb-hero-list">
+        <li>Gratis frakt</li>
+        <li>Ingen abonnement</li>
+        <li>Rask behandling av ordre</li>
+      </ul>
+    </section>
+
+    <section id="productsSection">
+      <h2>Produkter</h2>
+      <div id="productsContainer"></div>
+    </section>
+
+    <section class="vb-cart-panel" id="cartPanel">
+      <h2>Handlekurv</h2>
+      <div id="cartItems"></div>
+      <div class="vb-cart-summary">
+        <div>
+          <div>Totalt:</div>
+          <div class="vb-cart-total" id="cartTotal">0 kr</div>
+        </div>
+        <div class="vb-shipping">Gratis frakt er alltid inkludert.</div>
+      </div>
+
+      <div class="vb-checkout">
+        <label for="email">E-post for ordrebekreftelse</label>
+        <input type="email" id="email" placeholder="din.epost@eksempel.no" />
+
+        <div id="paymentMethods" class="vb-payment-methods">
+          <!-- Stripe/Vipps/manuell-knapper settes inn med JS -->
+        </div>
+
+        <div class="vb-info-row">
+          Ingen abonnement. Du betaler kun for det du bestiller.
+        </div>
+        <div id="status" class="vb-status"></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="vb-bottom-bar" id="bottomBar">
+    <div>
+      <span>Handlekurv</span>
+      <strong id="bottomBarTotal">0 kr</strong>
+    </div>
+    <button id="bottomBarCheckoutBtn">Gå til betaling</button>
+  </div>
+
+  <script>
+    let config = {};
+    let products = [];
+    let categories = [];
+    let cart = [];
+
+    const dynamicStyle = document.getElementById("dynamic-style");
+    const storeNameEl = document.getElementById("storeName");
+    const heroTitleEl = document.getElementById("heroTitle");
+    const heroSubtitleEl = document.getElementById("heroSubtitle");
+    const productsContainer = document.getElementById("productsContainer");
+    const cartItemsEl = document.getElementById("cartItems");
+    const cartTotalEl = document.getElementById("cartTotal");
+    const bottomBarTotalEl = document.getElementById("bottomBarTotal");
+    const statusEl = document.getElementById("status");
+    const emailInput = document.getElementById("email");
+    const paymentMethodsEl = document.getElementById("paymentMethods");
+    const bottomBarCheckoutBtn = document.getElementById("bottomBarCheckoutBtn");
+    const mobileFocusBtn = document.getElementById("mobileFocusBtn");
+
+    async function loadAll() {
+      try {
+        const [cRes, catRes, prodRes] = await Promise.all([
+          fetch("/api/config"),
+          fetch("/api/categories"),
+          fetch("/api/products")
+        ]);
+        config = await cRes.json();
+        categories = await catRes.json();
+        products = await prodRes.json();
+        applyConfig();
+        renderProducts();
+        renderCart();
+        renderPaymentMethods();
+      } catch (e) {
+        console.error("Feil ved innlasting:", e);
+        productsContainer.innerHTML = "<p>Kunne ikke laste produkter.</p>";
+      }
+    }
+
+    function applyConfig() {
+      const primary = config.primary_color || "#1b7f5f";
+      const accent = config.accent_color || "#ffb347";
+      const imgHeight = config.image_height || "220";
+
+      storeNameEl.textContent = config.store_name || "Vitality Boost";
+      if (config.hero_title) heroTitleEl.textContent = config.hero_title;
+      if (config.hero_subtitle) heroSubtitleEl.textContent = config.hero_subtitle;
+
+      dynamicStyle.textContent = `
+        :root {{
+          --primary: ${primary};
+          --accent: ${accent};
+          --bg: #f5f5f7;
+          --text: #222;
+          --image-height: ${imgHeight}px;
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+          margin: 0;
+          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          background: var(--bg);
+          color: var(--text);
+        }}
+        .vb-header {{
+          background: #fff;
+          border-bottom: 1px solid #ddd;
+          padding: 0.6rem 1rem;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          position: sticky;
+          top: 0;
+          z-index: 20;
+        }}
+        .vb-logo {{
+          font-weight: 700;
+          font-size: 1.1rem;
+          color: var(--primary);
+        }}
+        .vb-tagline {{
+          font-size: 0.75rem;
+          color: #555;
+        }}
+        .vb-pill {{
+          border-radius: 999px;
+          border: 1px solid var(--primary);
+          background: var(--primary);
+          color: #fff;
+          padding: 0.3rem 0.8rem;
+          font-size: 0.75rem;
+          cursor: pointer;
+        }}
+        .vb-main {{
+          max-width: 960px;
+          margin: 0 auto;
+          padding: 0.8rem 0.8rem 4rem;
+        }}
+        .vb-hero h1 {{
+          font-size: 1.3rem;
+          margin-bottom: 0.4rem;
+        }}
+        .vb-hero p {{
+          font-size: 0.9rem;
+          color: #555;
+        }}
+        .vb-hero-list {{
+          padding-left: 1.2rem;
+          font-size: 0.85rem;
+          color: #555;
+        }}
+        #productsSection h2,
+        .vb-cart-panel h2 {{
+          font-size: 1.1rem;
+          margin-top: 1rem;
+          margin-bottom: 0.4rem;
+        }}
+        .vb-category-block {{
+          margin-bottom: 0.8rem;
+        }}
+        .vb-category-header {{
+          display:flex;
+          justify-content:space-between;
+          align-items:center;
+          cursor:pointer;
+          padding:0.4rem 0.2rem;
+        }}
+        .vb-category-header h3 {{
+          margin:0;
+          font-size:0.95rem;
+        }}
+        .vb-category-header span {{
+          font-size:0.8rem;
+          color:#666;
+        }}
+        .vb-products-grid {{
+          display:grid;
+          grid-template-columns: 1fr 1fr;
+          gap:0.5rem;
+        }}
+        @media (max-width:700px) {{
+          .vb-products-grid {{
+            grid-template-columns: 1fr;
+          }}
+        }}
+        .vb-product-card {{
+          background:#fff;
+          border-radius:0.5rem;
+          padding:0.6rem;
+          box-shadow:0 1px 3px rgba(0,0,0,0.05);
+          display:flex;
+          flex-direction:column;
+          gap:0.3rem;
+        }}
+        .vb-product-image {{
+          width:100%;
+          height:var(--image-height);
+          object-fit:cover;
+          border-radius:0.4rem;
+          margin-bottom:0.3rem;
+        }}
+        .vb-product-title {{
+          font-weight:600;
+          font-size:0.95rem;
+        }}
+        .vb-product-desc {{
+          font-size:0.8rem;
+          color:#666;
+        }}
+        .vb-product-price {{
+          font-weight:600;
+          color:var(--primary);
+          font-size:0.9rem;
+        }}
+        .vb-product-stock {{
+          font-size:0.7rem;
+          color:#777;
+        }}
+        .vb-product-actions {{
+          display:flex;
+          align-items:center;
+          justify-content:space-between;
+          gap:0.4rem;
+          margin-top:0.3rem;
+        }}
+        .vb-qty-input {{
+          width:60px;
+          padding:0.2rem;
+          font-size:0.8rem;
+        }}
+        .vb-btn-primary {{
+          border:none;
+          border-radius:999px;
+          background:var(--primary);
+          color:#fff;
+          padding:0.3rem 0.7rem;
+          font-size:0.8rem;
+          cursor:pointer;
+        }}
+        .vb-btn-primary:disabled {{
+          opacity:0.5;
+          cursor:not-allowed;
+        }}
+        .vb-cart-panel {{
+          margin-top:1rem;
+          background:#fff;
+          border-radius:0.7rem;
+          padding:0.8rem;
+          box-shadow:0 1px 6px rgba(0,0,0,0.07);
+        }}
+        #cartItems {{
+          max-height:220px;
+          overflow-y:auto;
+          border-top:1px solid #eee;
+          border-bottom:1px solid #eee;
+          margin:0.4rem 0;
+          padding:0.4rem 0;
+        }}
+        .vb-cart-item {{
+          display:flex;
+          justify-content:space-between;
+          align-items:center;
+          font-size:0.85rem;
+          margin-bottom:0.3rem;
+          gap:0.3rem;
+        }}
+        .vb-cart-item-title {{
+          flex:1;
+        }}
+        .vb-cart-item-controls {{
+          display:flex;
+          align-items:center;
+          gap:0.25rem;
+        }}
+        .vb-chip {{
+          border-radius:999px;
+          border:1px solid #ccc;
+          padding:0 0.4rem;
+          font-size:0.75rem;
+          background:#fafafa;
+          cursor:pointer;
+        }}
+        .vb-cart-summary {{
+          display:flex;
+          justify-content:space-between;
+          align-items:flex-end;
+          gap:0.4rem;
+          font-size:0.9rem;
+        }}
+        .vb-cart-total {{ font-weight:700; font-size:1rem; }}
+        .vb-shipping {{ font-size:0.8rem; color:#555; }}
+        .vb-checkout {{
+          margin-top:0.6rem;
+          display:flex;
+          flex-direction:column;
+          gap:0.4rem;
+        }}
+        .vb-checkout input[type="email"]{{
+          padding:0.35rem 0.5rem;
+          border-radius:0.4rem;
+          border:1px solid #ccc;
+          font-size:0.85rem;
+        }}
+        .vb-payment-methods {{
+          display:flex;
+          gap:0.4rem;
+          flex-wrap:wrap;
+          margin-top:0.2rem;
+        }}
+        .vb-pay-btn {{
+          flex:1;
+          border:none;
+          border-radius:999px;
+          padding:0.4rem 0.6rem;
+          font-size:0.85rem;
+          cursor:pointer;
+          color:#fff;
+        }}
+        .vb-pay-stripe {{ background:#635bff; }}
+        .vb-pay-vipps {{ background:#ff5b24; }}
+        .vb-info-row {{ font-size:0.75rem; color:#666; }}
+        .vb-status {{ font-size:0.8rem; margin-top:0.3rem; }}
+        .vb-status.success {{ color:green; }}
+        .vb-status.error {{ color:#c00; }}
+        .vb-bottom-bar {{
+          position:fixed;
+          left:0;
+          right:0;
+          bottom:0;
+          background:#fff;
+          border-top:1px solid #ddd;
+          display:flex;
+          justify-content:space-between;
+          align-items:center;
+          padding:0.5rem 0.8rem;
+          font-size:0.9rem;
+          box-shadow:0 -1px 4px rgba(0,0,0,0.05);
+        }}
+        .vb-bottom-bar button {{
+          border:none;
+          border-radius:999px;
+          background:var(--primary);
+          color:#fff;
+          padding:0.35rem 0.9rem;
+          font-size:0.85rem;
+          cursor:pointer;
+        }}
+        @media (min-width:900px) {{
+          .vb-main {{
+            display:grid;
+            grid-template-columns: 2fr 1fr;
+            gap:1rem;
+          }}
+          .vb-bottom-bar {{
+            display:none;
+          }}
+        }}
+      `;
+    }
+
+    function renderProducts() {
+      if (!products || products.length === 0) {
+        productsContainer.innerHTML = "<p>Ingen produkter tilgjengelig.</p>";
+        return;
+      }
+
+      const byCat = {};
+      products.forEach((p) => {
+        const cid = p.category_id || "none";
+        if (!byCat[cid]) byCat[cid] = [];
+        byCat[cid].push(p);
+      });
+
+      productsContainer.innerHTML = "";
+      const catName = (id) => {
+        if (id === "none") return "Andre produkter";
+        const c = categories.find((x) => x.id === id);
+        return c ? c.name : "Andre produkter";
+      };
+
+      Object.keys(byCat)
+        .sort()
+        .forEach((cid) => {
+          const block = document.createElement("div");
+          block.className = "vb-category-block";
+
+          const header = document.createElement("div");
+          header.className = "vb-category-header";
+          const title = document.createElement("h3");
+          title.textContent = catName(cid);
+          const count = document.createElement("span");
+          count.textContent = byCat[cid].length + " produkt(er)";
+          header.appendChild(title);
+          header.appendChild(count);
+
+          const grid = document.createElement("div");
+          grid.className = "vb-products-grid";
+
+          byCat[cid].forEach((p) => {
+            const card = document.createElement("div");
+            card.className = "vb-product-card";
+            const imgUrl = p.image_url || "https://via.placeholder.com/300x200?text=Produkt";
+
+            card.innerHTML = `
+              <img src="${imgUrl}" alt="${p.title}" class="vb-product-image" />
+              <div class="vb-product-title">${p.title}</div>
+              <div class="vb-product-desc">${p.short_description || ""}</div>
+              <div class="vb-product-price">${p.price} kr</div>
+              <div class="vb-product-stock">${p.stock > 0 ? "På lager: " + p.stock + " stk" : "Utsolgt"}</div>
+              <div class="vb-product-actions">
+                <input type="number" min="1" max="${p.stock}" value="1" class="vb-qty-input" />
+                <button class="vb-btn-primary" ${p.stock <= 0 ? "disabled" : ""}>Legg i kurv</button>
+              </div>
+            `;
+            const qtyInput = card.querySelector("input");
+            const addBtn = card.querySelector("button");
+            addBtn.addEventListener("click", () => {
+              const qty = parseInt(qtyInput.value, 10) || 1;
+              if (qty <= 0) return;
+              if (qty > p.stock) {
+                showStatus("Ikke nok på lager for dette produktet.", true);
+                return;
+              }
+              addToCart(p, qty);
+            });
+            grid.appendChild(card);
+          });
+
+          header.addEventListener("click", () => {
+            const isHidden = grid.style.display === "none";
+            grid.style.display = isHidden ? "grid" : "none";
+          });
+
+          block.appendChild(header);
+          block.appendChild(grid);
+          productsContainer.appendChild(block);
+        });
+    }
+
+    function addToCart(product, qty) {
+      const existing = cart.find((c) => c.id === product.id);
+      if (existing) {
+        const totalQty = existing.qty + qty;
+        if (totalQty > product.stock) {
+          showStatus("Du kan ikke bestille mer enn lagerbeholdning.", true);
+          return;
+        }
+        existing.qty = totalQty;
+      } else {
+        cart.push({
+          id: product.id,
+          title: product.title,
+          price: product.price,
+          qty
+        });
+      }
+      renderCart();
+      showStatus("Produkt lagt i handlekurv.", false);
+    }
+
+    function renderCart() {
+      cartItemsEl.innerHTML = "";
+      if (cart.length === 0) {
+        cartItemsEl.innerHTML = "<p>Handlekurven er tom.</p>";
+        cartTotalEl.textContent = "0 kr";
+        bottomBarTotalEl.textContent = "0 kr";
+        return;
+      }
+      let total = 0;
+      cart.forEach((item) => {
+        const row = document.createElement("div");
+        row.className = "vb-cart-item";
+        const productData = products.find((p) => p.id === item.id);
+        const maxStock = productData ? productData.stock : item.qty;
+        total += item.price * item.qty;
+
+        row.innerHTML = `
+          <div class="vb-cart-item-title">${item.title}</div>
+          <div class="vb-cart-item-controls">
+            <button class="vb-chip" data-action="minus">-</button>
+            <span>${item.qty}</span>
+            <button class="vb-chip" data-action="plus">+</button>
+            <span>${item.price * item.qty} kr</span>
+            <button class="vb-chip" data-action="remove" title="Fjern">x</button>
+          </div>
+        `;
+        const minusBtn = row.querySelector('[data-action="minus"]');
+        const plusBtn = row.querySelector('[data-action="plus"]');
+        const removeBtn = row.querySelector('[data-action="remove"]');
+
+        minusBtn.addEventListener("click", () => {
+          if (item.qty > 1) item.qty -= 1;
+          else cart = cart.filter((c) => c.id !== item.id);
+          renderCart();
+        });
+
+        plusBtn.addEventListener("click", () => {
+          if (item.qty < maxStock) {
+            item.qty += 1;
+            renderCart();
+          } else {
+            showStatus("Ikke mer på lager av dette produktet.", true);
+          }
+        });
+
+        removeBtn.addEventListener("click", () => {
+          cart = cart.filter((c) => c.id !== item.id);
+          renderCart();
+        });
+
+        cartItemsEl.appendChild(row);
+      });
+      cartTotalEl.textContent = total + " kr";
+      bottomBarTotalEl.textContent = total + " kr";
+    }
+
+    function renderPaymentMethods() {
+      paymentMethodsEl.innerHTML = "";
+      const stripeOn = config.stripe_enabled === "1";
+      const vippsOn = config.vipps_enabled === "1";
+
+      if (!stripeOn && !vippsOn) {
+        const btn = document.createElement("button");
+        btn.className = "vb-btn-primary";
+        btn.textContent = "Send bestilling (manuelt)";
+        btn.addEventListener("click", manualCheckout);
+        paymentMethodsEl.appendChild(btn);
+        return;
+      }
+
+      if (vippsOn) {
+        const btnVipps = document.createElement("button");
+        btnVipps.className = "vb-pay-btn vb-pay-vipps";
+        btnVipps.textContent = "Betal med Vipps";
+        btnVipps.addEventListener("click", () => payWith("vipps"));
+        paymentMethodsEl.appendChild(btnVipps);
+      }
+
+      if (stripeOn) {
+        const btnStripe = document.createElement("button");
+        btnStripe.className = "vb-pay-btn vb-pay-stripe";
+        btnStripe.textContent = "Betal med kort";
+        btnStripe.addEventListener("click", () => payWith("stripe"));
+        paymentMethodsEl.appendChild(btnStripe);
+      }
+    }
+
+    function showStatus(msg, isError) {
+      statusEl.textContent = msg;
+      statusEl.className = "vb-status " + (isError ? "error" : "success");
+      if (!msg) return;
+      setTimeout(() => {
+        statusEl.textContent = "";
+        statusEl.className = "vb-status";
+      }, 5000);
+    }
+
+    function getCartTotal() {
+      return cart.reduce((sum, item) => sum + item.price * item.qty, 0);
+    }
+
+    async function manualCheckout() {
+      if (cart.length === 0) {
+        showStatus("Handlekurven er tom.", true);
+        return;
+      }
+      const email = emailInput.value.trim();
+      if (!email) {
+        showStatus("Skriv inn e-postadressen din.", true);
+        return;
+      }
+      const amount = getCartTotal();
+      try {
+        const res = await fetch("/api/order/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, amount, method: "MANUAL" })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || "Feil");
+        cart = [];
+        renderCart();
+        showStatus("Bestilling sendt! Ordre-ID: " + data.orderId, false);
+      } catch (e) {
+        console.error(e);
+        showStatus("Kunne ikke sende bestilling. Prøv igjen.", true);
+      }
+    }
+
+    async function payWith(method) {
+      if (cart.length === 0) {
+        showStatus("Handlekurven er tom.", true);
+        return;
+      }
+      const email = emailInput.value.trim();
+      if (!email) {
+        showStatus("Skriv inn e-postadressen din.", true);
+        return;
+      }
+
+      if (method === "vipps") {
+        try {
+          const res = await fetch("/api/pay/vipps-init", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cart, email })
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || "Feil");
+          cart = [];
+          renderCart();
+          showStatus(
+            "Ordre registrert med Vipps. Vi følger opp betalingen. Ordre-ID: " +
+              data.orderId,
+            false
+          );
+        } catch (e) {
+          console.error(e);
+          showStatus("Kunne ikke starte Vipps-betaling.", true);
+        }
+      }
+
+      if (method === "stripe") {
+        try {
+          const res = await fetch("/api/pay/stripe-session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cart, email })
+          });
+          const data = await res.json();
+          if (!res.ok || !data.ok) throw new Error(data.error || "Feil");
+          const publicKey = data.publicKey;
+          const sessionId = data.sessionId;
+          if (!publicKey || !sessionId) throw new Error("Stripe-verdier mangler");
+          const stripeJs = document.createElement("script");
+          stripeJs.src = "https://js.stripe.com/v3/";
+          stripeJs.onload = async () => {
+            const stripe = Stripe(publicKey);
+            const { error } = await stripe.redirectToCheckout({ sessionId });
+            if (error) {
+              console.error(error);
+              showStatus("Stripe-feil: " + error.message, true);
+            }
+          };
+          document.body.appendChild(stripeJs);
+        } catch (e) {
+          console.error(e);
+          showStatus("Kunne ikke starte kortbetaling.", true);
+        }
+      }
+    }
+
+    bottomBarCheckoutBtn.addEventListener("click", () => {
+      document.getElementById("cartPanel").scrollIntoView({ behavior: "smooth" });
+    });
+
+    mobileFocusBtn.addEventListener("click", () => {
+      alert("Nettbutikken er optimalisert for mobil. Åpne denne siden på telefonen for best opplevelse.");
+    });
+
+    loadAll();
+  </script>
+</body>
+</html>
