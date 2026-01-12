@@ -1,57 +1,60 @@
-import sqlite3
+# app.py
 import os
-from flask import Flask, request, session, redirect, send_from_directory, jsonify
-from flask import make_response
-
+import sqlite3
+from io import BytesIO
 from datetime import datetime
-import json
+from flask import (
+    Flask, request, session, redirect, url_for, render_template_string,
+    send_file, jsonify, flash
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
+# Optional stripe import handled gracefully
 try:
     import stripe
 except ImportError:
-    stripe = None  # håndteres dynamisk
+    stripe = None
 
 app = Flask(__name__)
-app.secret_key = "vitalityboost_admin_secret"
+app.secret_key = os.getenv("FLASK_SECRET", "vitalityboost_admin_secret")
 
-DB_PATH = "database.db"
+DB_PATH = os.getenv("DB_PATH", "database.db")
+ALLOWED_EXT = {"png", "jpg", "jpeg", "gif"}
 
-
+# -------------------------
+# Database helpers
+# -------------------------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def init_db():
     conn = get_db()
     c = conn.cursor()
 
-    # Produkter
     c.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
             price INTEGER,
-            active INTEGER,
-            stock INTEGER,
+            active INTEGER DEFAULT 1,
+            stock INTEGER DEFAULT 0,
             category_id INTEGER,
-            image_url TEXT,
-            short_description TEXT
+            image_id INTEGER,
+            short_description TEXT,
+            long_description TEXT
         )
     """)
-
-    # Kategorier
     c.execute("""
         CREATE TABLE IF NOT EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
-            sort_order INTEGER,
-            active INTEGER
+            sort_order INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1
         )
     """)
-
-    # Ordrer
     c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id TEXT PRIMARY KEY,
@@ -62,760 +65,616 @@ def init_db():
             created DATETIME
         )
     """)
-
-    # Admin-brukere
     c.execute("""
         CREATE TABLE IF NOT EXISTS admins (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE,
-            password TEXT
+            password_hash TEXT,
+            created DATETIME
         )
     """)
-
-    # Innstillinger
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT,
+            content_type TEXT,
+            data BLOB,
+            created DATETIME
+        )
+    """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
+    conn.commit()
 
-    # Seed admin
-    c.execute("SELECT COUNT(*) AS count FROM admins")
-    if c.fetchone()["count"] == 0:
-        c.execute("INSERT INTO admins (username, password) VALUES (?, ?)",
-                  ("admin", "admin123"))
+    # Ensure default admin exists (username: admin, password: admin) — change after first login
+    cur = conn.execute("SELECT * FROM admins WHERE username = ?", ("admin",))
+    if not cur.fetchone():
+        conn.execute(
+            "INSERT INTO admins (username, password_hash, created) VALUES (?, ?, ?)",
+            ("admin", generate_password_hash("admin"), datetime.utcnow())
+        )
+        conn.commit()
 
-    # Seed settings
-    c.execute("SELECT COUNT(*) AS count FROM settings")
-    if c.fetchone()["count"] == 0:
-        defaults = {
-            "store_name": "Vitality Boost",
-            "hero_title": "Premium kosttilskudd – uten abonnement og med gratis frakt",
-            "hero_subtitle": "Velg produktene, legg inn e-post og betal trygt med kort eller Vipps.",
-            "primary_color": "#1b7f5f",
-            "accent_color": "#ffb347",
-            "image_height": "220",
-            "stripe_enabled": "0",
-            "vipps_enabled": "0",
-            "stripe_public_key": "",
-            "stripe_secret_key": "",
-            "vipps_merchant_key": "",
-        }
-        for k, v in defaults.items():
-            c.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (k, v))
-
-    # Seed produkter/kategorier
-    c.execute("SELECT COUNT(*) AS count FROM products")
-    if c.fetchone()["count"] == 0:
-        c.execute("INSERT INTO categories (name, sort_order, active) VALUES (?,?,?)",
-                  ("Bestselgere", 1, 1))
-        c.execute("SELECT id FROM categories WHERE name=?", ("Bestselgere",))
-        cat_id = c.fetchone()["id"]
-        products = [
-            ("Omega Vital+", 399, 1, 20, cat_id,
-             "https://via.placeholder.com/300x200?text=Omega+Vital%2B",
-             "Essensielle fettsyrer for hjerte og ledd."),
-            ("Collagen Boost 50+", 449, 1, 15, cat_id,
-             "https://via.placeholder.com/300x200?text=Collagen+Boost+50%2B",
-             "Hud, ledd og bindevev – spesielt for 50+."),
-            ("MindSharp Focus", 349, 1, 25, cat_id,
-             "https://via.placeholder.com/300x200?text=MindSharp+Focus",
-             "For fokus og mental klarhet i hverdagen."),
-        ]
-        c.executemany("""
-            INSERT INTO products
-            (title, price, active, stock, category_id, image_url, short_description)
-            VALUES (?,?,?,?,?,?,?)
-        """, products)
-
+    # Default theme settings (expert chosen palette)
+    defaults = {
+        "header_bg": "#0B3D91",        # deep blue
+        "header_fg": "#FFFFFF",        # white
+        "product_bg": "#FFFFFF",       # white cards
+        "product_fg": "#111827",       # near black text
+        "accent": "#FF6B35",           # warm orange accent
+        "page_bg": "#F7FAFC",          # light gray background
+        "font_family": "Inter, system-ui, Arial, sans-serif"
+    }
+    for k, v in defaults.items():
+        cur = conn.execute("SELECT value FROM settings WHERE key = ?", (k,))
+        if not cur.fetchone():
+            conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (k, v))
     conn.commit()
     conn.close()
 
-
-def get_settings(keys):
-    if isinstance(keys, str):
-        keys = [keys]
+# -------------------------
+# Utility helpers
+# -------------------------
+def get_setting(key, default=None):
     conn = get_db()
-    c = conn.cursor()
-    placeholders = ",".join(["?"] * len(keys))
-    c.execute(f"SELECT key, value FROM settings WHERE key IN ({placeholders})", keys)
-    rows = c.fetchall()
+    cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = cur.fetchone()
     conn.close()
-    out = {}
-    for r in rows:
-        out[r["key"]] = r["value"]
-    return out
-
+    return row["value"] if row else default
 
 def set_setting(key, value):
     conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
     conn.commit()
     conn.close()
 
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
 
-def require_admin():
-    if "admin" not in session:
-        return False
-    return True
+# -------------------------
+# Image endpoints
+# -------------------------
+@app.route("/admin/upload_image", methods=["GET", "POST"])
+def admin_upload_image():
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    if request.method == "POST":
+        f = request.files.get("image")
+        if not f or f.filename == "":
+            flash("Ingen fil valgt", "error")
+            return redirect(request.url)
+        if not allowed_file(f.filename):
+            flash("Ugyldig filtype", "error")
+            return redirect(request.url)
+        data = f.read()
+        conn = get_db()
+        cur = conn.execute(
+            "INSERT INTO images (filename, content_type, data, created) VALUES (?, ?, ?, ?)",
+            (secure_filename(f.filename), f.content_type, data, datetime.utcnow())
+        )
+        conn.commit()
+        image_id = cur.lastrowid
+        conn.close()
+        flash("Bilde lastet opp", "success")
+        return redirect(url_for("admin_images"))
+    return render_template_string(ADMIN_UPLOAD_TEMPLATE, settings=get_all_settings())
 
+@app.route("/image/<int:image_id>")
+def serve_image(image_id):
+    conn = get_db()
+    cur = conn.execute("SELECT filename, content_type, data FROM images WHERE id = ?", (image_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return ("Not found", 404)
+    return send_file(BytesIO(row["data"]), mimetype=row["content_type"], download_name=row["filename"])
 
-@app.route("/")
-def index():
-    return send_from_directory(".", "index.html")
-
-
+# -------------------------
+# Admin: login, logout, index
+# -------------------------
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-    if request.method == "GET":
-        html = """
-<!DOCTYPE html>
-<html lang="no">
-<head>
-<meta charset="UTF-8" />
-<title>Admin login</title>
-<style>
-body{font-family:system-ui;background:#f4f4f4;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{background:#fff;padding:1.5rem;border-radius:0.5rem;box-shadow:0 2px 8px rgba(0,0,0,0.1);width:300px;}
-h2{margin-top:0;margin-bottom:1rem;}
-input{width:100%;margin-bottom:0.5rem;padding:0.4rem;border-radius:0.3rem;border:1px solid #ccc;}
-button{width:100%;padding:0.5rem;border:none;border-radius:999px;background:#1b7f5f;color:#fff;font-weight:600;cursor:pointer;}
-</style>
-</head>
-<body>
-  <div class="box">
-    <h2>Admin login</h2>
-    <form method="POST">
-      <input type="text" name="username" placeholder="Brukernavn" required/>
-      <input type="password" name="password" placeholder="Passord" required/>
-      <button>Logg inn</button>
-    </form>
-  </div>
-</body>
-</html>
-        """
-        return html
-
-    username = request.form.get("username", "")
-    password = request.form.get("password", "")
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM admins WHERE username=? AND password=?",
-              (username, password))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        session["admin"] = {"id": row["id"], "username": row["username"]}
-        return redirect("/admin")
-    return "Feil brukernavn eller passord. Gå tilbake og prøv igjen."
-
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        conn = get_db()
+        cur = conn.execute("SELECT * FROM admins WHERE username = ?", (username,))
+        row = cur.fetchone()
+        conn.close()
+        if row and check_password_hash(row["password_hash"], password):
+            session["admin"] = username
+            return redirect(url_for("admin_index"))
+        flash("Ugyldig brukernavn eller passord", "error")
+    return render_template_string(ADMIN_LOGIN_TEMPLATE, settings=get_all_settings())
 
 @app.route("/admin/logout")
 def admin_logout():
-    session.clear()
-    return redirect("/admin/login")
-
+    session.pop("admin", None)
+    return redirect(url_for("admin_login"))
 
 @app.route("/admin")
-def admin_dashboard():
-    if not require_admin():
-        return redirect("/admin/login")
-
+def admin_index():
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
     conn = get_db()
-    c = conn.cursor()
-
-    c.execute("SELECT * FROM orders ORDER BY created DESC LIMIT 50")
-    orders = c.fetchall()
-
-    c.execute("""
-        SELECT p.*, c.name as category_name
-        FROM products p
-        LEFT JOIN categories c ON p.category_id=c.id
-        ORDER BY p.id
-    """)
-    products = c.fetchall()
-
-    c.execute("SELECT * FROM categories ORDER BY sort_order ASC, id ASC")
-    categories = c.fetchall()
-
-    settings = get_settings([
-        "store_name",
-        "hero_title",
-        "hero_subtitle",
-        "primary_color",
-        "accent_color",
-        "image_height",
-        "stripe_enabled",
-        "vipps_enabled",
-        "stripe_public_key",
-        "stripe_secret_key",
-        "vipps_merchant_key",
-    ])
-
-    total = sum([o["amount"] or 0 for o in orders])
-
+    products = conn.execute("SELECT * FROM products").fetchall()
+    images = conn.execute("SELECT id, filename FROM images ORDER BY created DESC").fetchall()
     conn.close()
+    return render_template_string(ADMIN_INDEX_TEMPLATE, products=products, images=images, settings=get_all_settings())
 
-    def esc(s):
-        if s is None:
-            return ""
-        return str(s).replace('"', "&quot;")
+# -------------------------
+# Admin: product CRUD and settings
+# -------------------------
+@app.route("/admin/product/new", methods=["GET", "POST"])
+def admin_product_new():
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    if request.method == "POST":
+        title = request.form.get("title")
+        price = int(request.form.get("price", "0"))
+        stock = int(request.form.get("stock", "0"))
+        short = request.form.get("short_description", "")
+        long = request.form.get("long_description", "")
+        image_id = request.form.get("image_id") or None
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO products (title, price, stock, short_description, long_description, image_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (title, price, stock, short, long, image_id)
+        )
+        conn.commit()
+        conn.close()
+        return redirect(url_for("admin_index"))
+    conn = get_db()
+    images = conn.execute("SELECT id, filename FROM images ORDER BY created DESC").fetchall()
+    conn.close()
+    return render_template_string(ADMIN_PRODUCT_FORM, product=None, images=images, settings=get_all_settings())
 
-    html = f"""
-<!DOCTYPE html>
-<html lang="no">
+@app.route("/admin/product/<int:pid>/edit", methods=["GET", "POST"])
+def admin_product_edit(pid):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    conn = get_db()
+    if request.method == "POST":
+        title = request.form.get("title")
+        price = int(request.form.get("price", "0"))
+        stock = int(request.form.get("stock", "0"))
+        short = request.form.get("short_description", "")
+        long = request.form.get("long_description", "")
+        image_id = request.form.get("image_id") or None
+        conn.execute(
+            "UPDATE products SET title=?, price=?, stock=?, short_description=?, long_description=?, image_id=? WHERE id=?",
+            (title, price, stock, short, long, image_id, pid)
+        )
+        conn.commit()
+        conn.close()
+        return redirect(url_for("admin_index"))
+    product = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+    images = conn.execute("SELECT id, filename FROM images ORDER BY created DESC").fetchall()
+    conn.close()
+    return render_template_string(ADMIN_PRODUCT_FORM, product=product, images=images, settings=get_all_settings())
+
+@app.route("/admin/product/<int:pid>/delete", methods=["POST"])
+def admin_product_delete(pid):
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    conn = get_db()
+    conn.execute("DELETE FROM products WHERE id = ?", (pid,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("admin_index"))
+
+@app.route("/admin/images")
+def admin_images():
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    conn = get_db()
+    images = conn.execute("SELECT id, filename FROM images ORDER BY created DESC").fetchall()
+    conn.close()
+    return render_template_string(ADMIN_IMAGES_TEMPLATE, images=images, settings=get_all_settings())
+
+@app.route("/admin/settings", methods=["GET", "POST"])
+def admin_settings():
+    if not session.get("admin"):
+        return redirect(url_for("admin_login"))
+    if request.method == "POST":
+        # Save theme settings
+        keys = ["header_bg", "header_fg", "product_bg", "product_fg", "accent", "page_bg", "font_family"]
+        for k in keys:
+            v = request.form.get(k, "")
+            set_setting(k, v)
+        flash("Innstillinger lagret", "success")
+        return redirect(url_for("admin_index"))
+    return render_template_string(ADMIN_SETTINGS_TEMPLATE, settings=get_all_settings())
+
+def get_all_settings():
+    conn = get_db()
+    rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    conn.close()
+    return {r["key"]: r["value"] for r in rows}
+
+# -------------------------
+# Frontend: shop, product, cart, checkout
+# -------------------------
+@app.route("/")
+def index():
+    conn = get_db()
+    products = conn.execute("SELECT * FROM products WHERE active=1").fetchall()
+    conn.close()
+    settings = get_all_settings()
+    return render_template_string(INDEX_TEMPLATE, products=products, settings=settings)
+
+@app.route("/product/<int:pid>")
+def product_detail(pid):
+    conn = get_db()
+    p = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+    conn.close()
+    if not p:
+        return ("Not found", 404)
+    settings = get_all_settings()
+    return render_template_string(PRODUCT_TEMPLATE, product=p, settings=settings)
+
+# Cart stored in session
+@app.route("/cart")
+def cart_view():
+    cart = session.get("cart", {})
+    conn = get_db()
+    items = []
+    total = 0
+    for pid, qty in cart.items():
+        p = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+        if p:
+            subtotal = p["price"] * qty
+            items.append({"product": p, "qty": qty, "subtotal": subtotal})
+            total += subtotal
+    conn.close()
+    settings = get_all_settings()
+    return render_template_string(CART_TEMPLATE, items=items, total=total, settings=settings)
+
+@app.route("/cart/add/<int:pid>", methods=["POST"])
+def cart_add(pid):
+    qty = int(request.form.get("qty", 1))
+    cart = session.get("cart", {})
+    cart[str(pid)] = cart.get(str(pid), 0) + qty
+    session["cart"] = cart
+    return redirect(url_for("cart_view"))
+
+@app.route("/cart/remove/<int:pid>", methods=["POST"])
+def cart_remove(pid):
+    cart = session.get("cart", {})
+    cart.pop(str(pid), None)
+    session["cart"] = cart
+    return redirect(url_for("cart_view"))
+
+@app.route("/checkout", methods=["GET", "POST"])
+def checkout():
+    if request.method == "POST":
+        email = request.form.get("email")
+        method = request.form.get("method", "simulated")
+        cart = session.get("cart", {})
+        if not cart:
+            flash("Handlekurven er tom", "error")
+            return redirect(url_for("cart_view"))
+        conn = get_db()
+        total = 0
+        for pid, qty in cart.items():
+            p = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+            if p:
+                total += p["price"] * qty
+        order_id = f"ord-{int(datetime.utcnow().timestamp())}"
+        conn.execute(
+            "INSERT INTO orders (id, email, amount, method, status, created) VALUES (?, ?, ?, ?, ?, ?)",
+            (order_id, email, total, method, "created", datetime.utcnow())
+        )
+        conn.commit()
+        conn.close()
+        session.pop("cart", None)
+        flash(f"Bestilling mottatt: {order_id}", "success")
+        return redirect(url_for("index"))
+    settings = get_all_settings()
+    return render_template_string(CHECKOUT_TEMPLATE, settings=settings)
+
+# -------------------------
+# Minimal templates (render_template_string)
+# -------------------------
+# For production you should move templates to files. These are inline for simplicity.
+BASE_CSS = """
+:root{
+  --header-bg: {{ settings.get('header_bg','#0B3D91') }};
+  --header-fg: {{ settings.get('header_fg','#FFFFFF') }};
+  --product-bg: {{ settings.get('product_bg','#FFFFFF') }};
+  --product-fg: {{ settings.get('product_fg','#111827') }};
+  --accent: {{ settings.get('accent','#FF6B35') }};
+  --page-bg: {{ settings.get('page_bg','#F7FAFC') }};
+  --font-family: {{ settings.get('font_family','Inter, system-ui, Arial, sans-serif') }};
+}
+*{box-sizing:border-box}
+body{font-family:var(--font-family);background:var(--page-bg);color:var(--product-fg);margin:0;padding:0}
+.header{background:var(--header-bg);color:var(--header-fg);padding:20px}
+.container{max-width:1100px;margin:20px auto;padding:0 16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
+.card{background:var(--product-bg);padding:12px;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,0.06)}
+.btn{background:var(--accent);color:#fff;padding:8px 12px;border:none;border-radius:6px;cursor:pointer;text-decoration:none}
+.small{font-size:0.9rem}
+.form-row{margin-bottom:8px}
+.input{padding:8px;border:1px solid #ddd;border-radius:6px;width:100%}
+.notice{padding:8px;border-radius:6px;margin-bottom:12px}
+.notice.success{background:#e6ffef;color:#064e3b}
+.notice.error{background:#ffe6e6;color:#7f1d1d}
+.footer{padding:20px;text-align:center;color:#6b7280}
+"""
+
+INDEX_TEMPLATE = """
+<!doctype html>
+<html>
 <head>
-<meta charset="UTF-8" />
-<title>Admin – {esc(settings.get('store_name', 'Vitality Boost'))}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<style>
-body{{font-family:system-ui;margin:0;background:#f5f5f7;color:#222;}}
-header{{background:#fff;border-bottom:1px solid #ddd;padding:0.5rem 1rem;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:10;}}
-header h1{{font-size:1.1rem;margin:0;}}
-nav button{{margin-right:0.3rem;padding:0.3rem 0.7rem;border-radius:999px;border:1px solid #ccc;background:#fff;cursor:pointer;font-size:0.85rem;}}
-nav button.active{{background:#222;color:#fff;border-color:#222;}}
-main{{padding:1rem;max-width:1100px;margin:0 auto;}}
-section{{display:none;}}
-section.active{{display:block;}}
-table{{width:100%;border-collapse:collapse;margin-top:0.5rem;font-size:0.85rem;}}
-th,td{{border:1px solid #ddd;padding:0.35rem;text-align:left;}}
-input[type="text"],input[type="number"],input[type="password"],input[type="email"]{{width:100%;box-sizing:border-box;padding:0.25rem;border-radius:0.25rem;border:1px solid #ccc;font-size:0.85rem;}}
-textarea{{width:100%;box-sizing:border-box;padding:0.25rem;border-radius:0.25rem;border:1px solid #ccc;font-size:0.85rem;}}
-button.primary{{background:#1b7f5f;color:#fff;border:none;border-radius:999px;padding:0.35rem 0.8rem;cursor:pointer;font-size:0.85rem;}}
-.btn-sm{{font-size:0.75rem;padding:0.2rem 0.5rem;}}
-.badge{{display:inline-block;padding:0.1rem 0.35rem;border-radius:999px;font-size:0.7rem;background:#eee;}}
-.badge.ok{{background:#e6f5f0;color:#1b7f5f;}}
-.flex{{display:flex;gap:0.5rem;flex-wrap:wrap;}}
-.card{{background:#fff;border-radius:0.5rem;padding:0.75rem;box-shadow:0 1px 3px rgba(0,0,0,0.05);margin-top:0.5rem;}}
-</style>
+  <meta charset="utf-8">
+  <title>Vitalityboost - Butikk</title>
+  <style>{{ base_css }}</style>
 </head>
 <body>
-
-<header>
-  <h1>Admin – {esc(settings.get('store_name', 'Vitality Boost'))}</h1>
-  <div>
-    <span class="badge ok">Ordrer: {len(orders)}</span>
-    <span class="badge ok">Omsetning: {total} kr</span>
-    <a href="/admin/logout" style="margin-left:0.7rem;font-size:0.8rem;">Logg ut</a>
+  <div class="header">
+    <div class="container">
+      <h1>Vitalityboost</h1>
+      <div><a href="{{ url_for('cart_view') }}" class="btn small">Handlekurv</a> <a href="{{ url_for('admin_index') }}" class="btn small">Admin</a></div>
+    </div>
   </div>
-</header>
-
-<nav style="padding:0.3rem 1rem;">
-  <button data-tab="products" class="active">Produkter</button>
-  <button data-tab="categories">Kategorier</button>
-  <button data-tab="design">Design & tekster</button>
-  <button data-tab="payments">Betaling</button>
-  <button data-tab="orders">Ordrer</button>
-</nav>
-
-<main>
-
-<section id="tab-products" class="active">
-  <h2>Produkter</h2>
-  <form method="POST" action="/admin/product/new" class="card">
-    <h3>Nytt produkt</h3>
-    <div class="flex">
-      <div style="flex:2;">
-        <label>Tittel</label>
-        <input name="title" required />
-      </div>
-      <div style="flex:1;">
-        <label>Pris (kr)</label>
-        <input type="number" name="price" required />
-      </div>
-      <div style="flex:1;">
-        <label>Lager</label>
-        <input type="number" name="stock" value="10" required />
-      </div>
-    </div>
-    <div class="flex">
-      <div style="flex:1;">
-        <label>Kategori</label>
-        <select name="category_id">
-          <option value="">Ingen</option>
-          {''.join(f'<option value="{{c["id"]}}">{{c["name"]}}</option>'.replace('{{','{').replace('}}','}') for c in categories)}
-        </select>
-      </div>
-      <div style="flex:2;">
-        <label>Bilde-URL</label>
-        <input name="image_url" placeholder="https://..." />
-      </div>
-    </div>
-    <div>
-      <label>Kort beskrivelse</label>
-      <textarea name="short_description" rows="2"></textarea>
-    </div>
-    <div style="margin-top:0.5rem;">
-      <label>Aktiv: <input type="checkbox" name="active" checked /></label>
-    </div>
-    <button class="primary" style="margin-top:0.5rem;">Lag produkt</button>
-  </form>
-
-  <div class="card">
-    <h3>Eksisterende produkter</h3>
-    <table>
-      <tr>
-        <th>ID</th><th>Tittel</th><th>Pris</th><th>Lager</th><th>Aktiv</th>
-        <th>Kategori</th><th>Bilde</th><th>Tekst</th><th></th>
-      </tr>
-"""
-    for p in products:
-        html += f"""
-      <tr>
-        <form method="POST" action="/admin/product/{p['id']}">
-          <td>{p['id']}</td>
-          <td><input name="title" value="{esc(p['title'])}" /></td>
-          <td><input type="number" name="price" value="{p['price']}" /></td>
-          <td><input type="number" name="stock" value="{p['stock']}" /></td>
-          <td>
-            <select name="active">
-              <option value="1" {"selected" if p["active"] else ""}>Ja</option>
-              <option value="0" {"selected" if not p["active"] else ""}>Nei</option>
-            </select>
-          </td>
-          <td>
-            <select name="category_id">
-              <option value="">Ingen</option>
-        """
-        for c in categories:
-            sel = "selected" if p["category_id"] == c["id"] else ""
-            html += f'<option value="{c["id"]}" {sel}>{esc(c["name"])}</option>'
-        html += f"""
-            </select>
-          </td>
-          <td><input name="image_url" value="{esc(p['image_url'])}" /></td>
-          <td><input name="short_description" value="{esc(p['short_description'])}" /></td>
-          <td><button class="btn-sm primary">Lagre</button></td>
+  <div class="container">
+    <h2>Produkter</h2>
+    <div class="grid">
+      {% for p in products %}
+      <div class="card">
+        {% if p.image_id %}
+          <img src="{{ url_for('serve_image', image_id=p.image_id) }}" alt="" style="width:100%;height:160px;object-fit:cover;border-radius:6px">
+        {% endif %}
+        <h3>{{ p.title }}</h3>
+        <p class="small">{{ p.short_description }}</p>
+        <p><strong>{{ p.price }} NOK</strong></p>
+        <form action="{{ url_for('cart_add', pid=p.id) }}" method="post">
+          <input type="number" name="qty" value="1" min="1" class="input" style="width:80px;display:inline-block">
+          <button class="btn">Legg i handlekurv</button>
         </form>
-      </tr>
-"""
-    html += """
-    </table>
+        <a href="{{ url_for('product_detail', pid=p.id) }}" class="small">Detaljer</a>
+      </div>
+      {% endfor %}
+    </div>
   </div>
-</section>
-
-<section id="tab-categories">
-  <h2>Kategorier</h2>
-  <form method="POST" action="/admin/category/new" class="card">
-    <h3>Ny kategori</h3>
-    <div class="flex">
-      <div style="flex:2;">
-        <label>Navn</label>
-        <input name="name" required />
-      </div>
-      <div style="flex:1;">
-        <label>Sortering</label>
-        <input type="number" name="sort_order" value="1" />
-      </div>
-    </div>
-    <div style="margin-top:0.5rem;">
-      <label>Aktiv: <input type="checkbox" name="active" checked /></label>
-    </div>
-    <button class="primary" style="margin-top:0.5rem;">Lag kategori</button>
-  </form>
-
-  <div class="card">
-    <h3>Eksisterende kategorier</h3>
-    <table>
-      <tr><th>ID</th><th>Navn</th><th>Sortering</th><th>Aktiv</th><th></th></tr>
-"""
-    for c in categories:
-        html += f"""
-      <tr>
-        <form method="POST" action="/admin/category/{c['id']}">
-          <td>{c['id']}</td>
-          <td><input name="name" value="{esc(c['name'])}" /></td>
-          <td><input type="number" name="sort_order" value="{c['sort_order']}" /></td>
-          <td>
-            <select name="active">
-              <option value="1" {"selected" if c["active"] else ""}>Ja</option>
-              <option value="0" {"selected" if not c["active"] else ""}>Nei</option>
-            </select>
-          </td>
-          <td><button class="btn-sm primary">Lagre</button></td>
-        </form>
-      </tr>
-"""
-    html += f"""
-    </table>
-  </div>
-</section>
-
-<section id="tab-design">
-  <h2>Design & tekster</h2>
-  <form method="POST" action="/admin/settings" class="card">
-    <h3>Butikknavn og topptekst</h3>
-    <label>Butikknavn</label>
-    <input name="store_name" value="{esc(settings.get('store_name',''))}" />
-    <label>Hovedoverskrift</label>
-    <input name="hero_title" value="{esc(settings.get('hero_title',''))}" />
-    <label>Undertekst</label>
-    <textarea name="hero_subtitle" rows="2">{esc(settings.get('hero_subtitle',''))}</textarea>
-
-    <h3>Farger og bilder</h3>
-    <div class="flex">
-      <div style="flex:1;">
-        <label>Primærfarge (hex)</label>
-        <input name="primary_color" value="{esc(settings.get('primary_color','#1b7f5f'))}" />
-      </div>
-      <div style="flex:1;">
-        <label>Accent-farge (hex)</label>
-        <input name="accent_color" value="{esc(settings.get('accent_color','#ffb347'))}" />
-      </div>
-    </div>
-    <div style="margin-top:0.5rem;">
-      <label>Bildehøyde (px)</label>
-      <input type="range" min="120" max="320" name="image_height_slider"
-             value="{esc(settings.get('image_height','220'))}"
-             oninput="document.getElementById('imgHeightVal').innerText=this.value;
-                      document.getElementById('image_height_hidden').value=this.value;">
-      <div>Valgt: <span id="imgHeightVal">{esc(settings.get('image_height','220'))}</span> px</div>
-      <input type="hidden" id="image_height_hidden" name="image_height"
-             value="{esc(settings.get('image_height','220'))}">
-    </div>
-    <button class="primary" style="margin-top:0.75rem;">Lagre design & tekster</button>
-  </form>
-</section>
-
-<section id="tab-payments">
-  <h2>Betaling (Stripe/Vipps)</h2>
-  <form method="POST" action="/admin/payments" class="card">
-    <h3>Stripe</h3>
-    <label><input type="checkbox" name="stripe_enabled" value="1" {"checked" if settings.get("stripe_enabled")=="1" else ""}/> Stripe aktivert</label>
-    <label>Stripe public key</label>
-    <input name="stripe_public_key" value="{esc(settings.get('stripe_public_key',''))}" />
-    <label>Stripe secret key</label>
-    <input name="stripe_secret_key" value="{esc(settings.get('stripe_secret_key',''))}" />
-
-    <h3 style="margin-top:1rem;">Vipps</h3>
-    <label><input type="checkbox" name="vipps_enabled" value="1" {"checked" if settings.get("vipps_enabled")=="1" else ""}/> Vipps aktivert</label>
-    <label>Vipps merchant key (plassholder)</label>
-    <input name="vipps_merchant_key" value="{esc(settings.get('vipps_merchant_key',''))}" />
-    <p style="font-size:0.8rem;color:#666;">
-      Vipps-integrasjonen i denne varianten registrerer ordren som Vipps-ordre. Videre integrasjon kan bygges på toppen.
-    </p>
-
-    <button class="primary" style="margin-top:0.75rem;">Lagre betalingsinnstillinger</button>
-  </form>
-</section>
-
-<section id="tab-orders">
-  <h2>Siste ordrer</h2>
-  <div class="card">
-    <table>
-      <tr><th>ID</th><th>E-post</th><th>Beløp</th><th>Metode</th><th>Status</th><th>Tid</th></tr>
-"""
-    for o in orders:
-        html += f"""
-      <tr>
-        <td>{o['id']}</td>
-        <td>{esc(o['email'])}</td>
-        <td>{o['amount']}</td>
-        <td>{esc(o['method'])}</td>
-        <td>{esc(o['status'])}</td>
-        <td>{esc(o['created'])}</td>
-      </tr>
-"""
-    html += """
-    </table>
-  </div>
-</section>
-
-</main>
-
-<script>
-const buttons = document.querySelectorAll('nav button');
-const sections = {
-  products: document.getElementById('tab-products'),
-  categories: document.getElementById('tab-categories'),
-  design: document.getElementById('tab-design'),
-  payments: document.getElementById('tab-payments'),
-  orders: document.getElementById('tab-orders')
-};
-buttons.forEach(btn=>{
-  btn.addEventListener('click',()=>{
-    buttons.forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    Object.values(sections).forEach(s=>s.classList.remove('active'));
-    sections[btn.dataset.tab].classList.add('active');
-  });
-});
-</script>
-
+  <div class="footer">© Vitalityboost</div>
 </body>
 </html>
 """
-    return html
 
+PRODUCT_TEMPLATE = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>{{ product.title }}</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>{{ product.title }}</h1><a href="{{ url_for('index') }}" class="btn small">Tilbake</a></div></div>
+  <div class="container">
+    <div style="display:flex;gap:16px;align-items:flex-start">
+      <div style="flex:1">
+        {% if product.image_id %}
+          <img src="{{ url_for('serve_image', image_id=product.image_id) }}" alt="" style="width:100%;height:360px;object-fit:cover;border-radius:8px">
+        {% endif %}
+      </div>
+      <div style="flex:1">
+        <h2>{{ product.title }}</h2>
+        <p>{{ product.long_description or product.short_description }}</p>
+        <p><strong>{{ product.price }} NOK</strong></p>
+        <form action="{{ url_for('cart_add', pid=product.id) }}" method="post">
+          <input type="number" name="qty" value="1" min="1" class="input" style="width:80px;display:inline-block">
+          <button class="btn">Legg i handlekurv</button>
+        </form>
+      </div>
+    </div>
+  </div>
+  <div class="footer">© Vitalityboost</div>
+</body>
+</html>
+"""
 
-@app.route("/admin/product/new", methods=["POST"])
-def admin_product_new():
-    if not require_admin():
-        return redirect("/admin/login")
-    f = request.form
-    title = f.get("title", "")
-    price = int(f.get("price", "0") or 0)
-    stock = int(f.get("stock", "0") or 0)
-    category_id = f.get("category_id") or None
-    image_url = f.get("image_url", "")
-    short_description = f.get("short_description", "")
-    active = 1 if f.get("active") else 0
+CART_TEMPLATE = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Handlekurv</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>Handlekurv</h1><a href="{{ url_for('index') }}" class="btn small">Fortsett å handle</a></div></div>
+  <div class="container">
+    {% if items %}
+      <table style="width:100%;border-collapse:collapse">
+        <thead><tr><th>Produkt</th><th>Antall</th><th>Pris</th><th>Subtotal</th><th></th></tr></thead>
+        <tbody>
+        {% for it in items %}
+          <tr>
+            <td>{{ it.product.title }}</td>
+            <td>{{ it.qty }}</td>
+            <td>{{ it.product.price }} NOK</td>
+            <td>{{ it.subtotal }} NOK</td>
+            <td>
+              <form action="{{ url_for('cart_remove', pid=it.product.id) }}" method="post">
+                <button class="btn small">Fjern</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <h3>Total: {{ total }} NOK</h3>
+      <a href="{{ url_for('checkout') }}" class="btn">Gå til betaling</a>
+    {% else %}
+      <p>Handlekurven er tom.</p>
+    {% endif %}
+  </div>
+  <div class="footer">© Vitalityboost</div>
+</body>
+</html>
+"""
 
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO products (title, price, active, stock, category_id, image_url, short_description)
-        VALUES (?,?,?,?,?,?,?)
-    """, (title, price, active, stock, category_id, image_url, short_description))
-    conn.commit()
-    conn.close()
-    return redirect("/admin")
+CHECKOUT_TEMPLATE = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Checkout</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>Betaling</h1><a href="{{ url_for('cart_view') }}" class="btn small">Tilbake til handlekurv</a></div></div>
+  <div class="container">
+    <form method="post">
+      <div class="form-row"><input class="input" name="email" placeholder="Epost" required></div>
+      <div class="form-row">
+        <label class="small">Betalingsmetode</label>
+        <select name="method" class="input">
+          <option value="simulated">Simulert betaling</option>
+          {% if stripe %}<option value="stripe">Stripe</option>{% endif %}
+        </select>
+      </div>
+      <button class="btn">Fullfør bestilling</button>
+    </form>
+  </div>
+  <div class="footer">© Vitalityboost</div>
+</body>
+</html>
+"""
 
+# -------------------------
+# Admin templates
+# -------------------------
+ADMIN_LOGIN_TEMPLATE = """
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Admin login</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>Admin</h1></div></div>
+  <div class="container">
+    <form method="post">
+      <div class="form-row"><input class="input" name="username" placeholder="Brukernavn"></div>
+      <div class="form-row"><input class="input" name="password" type="password" placeholder="Passord"></div>
+      <button class="btn">Logg inn</button>
+    </form>
+  </div>
+</body></html>
+"""
 
-@app.route("/admin/product/<int:pid>", methods=["POST"])
-def admin_product_update(pid):
-    if not require_admin():
-        return redirect("/admin/login")
-    f = request.form
-    title = f.get("title", "")
-    price = int(f.get("price", "0") or 0)
-    stock = int(f.get("stock", "0") or 0)
-    category_id = f.get("category_id") or None
-    image_url = f.get("image_url", "")
-    short_description = f.get("short_description", "")
-    active = 1 if f.get("active") == "1" else 0
+ADMIN_INDEX_TEMPLATE = """
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Admin</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>Admin</h1><a href="{{ url_for('admin_logout') }}" class="btn small">Logg ut</a></div></div>
+  <div class="container">
+    <h2>Produkter</h2>
+    <a href="{{ url_for('admin_product_new') }}" class="btn">Nytt produkt</a>
+    <a href="{{ url_for('admin_images') }}" class="btn">Bilder</a>
+    <a href="{{ url_for('admin_settings') }}" class="btn">Tema / fonter</a>
+    <div style="margin-top:12px">
+      {% for p in products %}
+        <div class="card" style="margin-bottom:8px">
+          <strong>{{ p.title }}</strong> — {{ p.price }} NOK
+          <div style="margin-top:8px">
+            <a href="{{ url_for('admin_product_edit', pid=p.id) }}" class="btn small">Rediger</a>
+            <form action="{{ url_for('admin_product_delete', pid=p.id) }}" method="post" style="display:inline">
+              <button class="btn small">Slett</button>
+            </form>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</body></html>
+"""
 
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE products
-        SET title=?, price=?, stock=?, category_id=?, image_url=?, short_description=?, active=?
-        WHERE id=?
-    """, (title, price, stock, category_id, image_url, short_description, active, pid))
-    conn.commit()
-    conn.close()
-    return redirect("/admin")
+ADMIN_PRODUCT_FORM = """
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Produkt</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>{% if product %}Rediger{% else %}Nytt{% endif %} produkt</h1></div></div>
+  <div class="container">
+    <form method="post">
+      <div class="form-row"><input class="input" name="title" placeholder="Tittel" value="{{ product.title if product else '' }}"></div>
+      <div class="form-row"><input class="input" name="price" placeholder="Pris (NOK)" value="{{ product.price if product else '' }}"></div>
+      <div class="form-row"><input class="input" name="stock" placeholder="Lager" value="{{ product.stock if product else '' }}"></div>
+      <div class="form-row"><textarea class="input" name="short_description" placeholder="Kort beskrivelse">{{ product.short_description if product else '' }}</textarea></div>
+      <div class="form-row"><textarea class="input" name="long_description" placeholder="Lang beskrivelse">{{ product.long_description if product else '' }}</textarea></div>
+      <div class="form-row">
+        <label class="small">Velg bilde</label>
+        <select name="image_id" class="input">
+          <option value="">Ingen</option>
+          {% for img in images %}
+            <option value="{{ img.id }}" {% if product and product.image_id==img.id %}selected{% endif %}>{{ img.filename }}</option>
+          {% endfor %}
+        </select>
+        <a href="{{ url_for('admin_upload_image') }}" class="btn small">Last opp nytt bilde</a>
+      </div>
+      <button class="btn">Lagre</button>
+    </form>
+  </div>
+</body></html>
+"""
 
+ADMIN_UPLOAD_TEMPLATE = """
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Last opp bilde</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>Last opp bilde</h1></div></div>
+  <div class="container">
+    <form method="post" enctype="multipart/form-data">
+      <div class="form-row"><input type="file" name="image" accept="image/*"></div>
+      <button class="btn">Last opp</button>
+    </form>
+  </div>
+</body></html>
+"""
 
-@app.route("/admin/category/new", methods=["POST"])
-def admin_category_new():
-    if not require_admin():
-        return redirect("/admin/login")
-    f = request.form
-    name = f.get("name", "")
-    sort_order = int(f.get("sort_order", "1") or 1)
-    active = 1 if f.get("active") else 0
+ADMIN_IMAGES_TEMPLATE = """
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Bilder</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>Bilder</h1></div></div>
+  <div class="container">
+    <a href="{{ url_for('admin_upload_image') }}" class="btn">Last opp nytt bilde</a>
+    <div style="margin-top:12px">
+      {% for img in images %}
+        <div class="card" style="display:flex;align-items:center;gap:12px">
+          <img src="{{ url_for('serve_image', image_id=img.id) }}" style="width:80px;height:80px;object-fit:cover;border-radius:6px">
+          <div>{{ img.filename }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</body></html>
+"""
 
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT INTO categories (name, sort_order, active) VALUES (?,?,?)",
-              (name, sort_order, active))
-    conn.commit()
-    conn.close()
-    return redirect("/admin")
+ADMIN_SETTINGS_TEMPLATE = """
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Tema</title><style>{{ base_css }}</style></head>
+<body>
+  <div class="header"><div class="container"><h1>Tema og fonter</h1></div></div>
+  <div class="container">
+    <form method="post">
+      <div class="form-row"><label class="small">Header bakgrunn</label><input class="input" name="header_bg" value="{{ settings.get('header_bg') }}"></div>
+      <div class="form-row"><label class="small">Header tekst</label><input class="input" name="header_fg" value="{{ settings.get('header_fg') }}"></div>
+      <div class="form-row"><label class="small">Produktkort bakgrunn</label><input class="input" name="product_bg" value="{{ settings.get('product_bg') }}"></div>
+      <div class="form-row"><label class="small">Produkt tekst</label><input class="input" name="product_fg" value="{{ settings.get('product_fg') }}"></div>
+      <div class="form-row"><label class="small">Accent farge</label><input class="input" name="accent" value="{{ settings.get('accent') }}"></div>
+      <div class="form-row"><label class="small">Side bakgrunn</label><input class="input" name="page_bg" value="{{ settings.get('page_bg') }}"></div>
+      <div class="form-row"><label class="small">Font family</label><input class="input" name="font_family" value="{{ settings.get('font_family') }}"></div>
+      <button class="btn">Lagre tema</button>
+    </form>
+  </div>
+</body></html>
+"""
 
+# -------------------------
+# Template context injection
+# -------------------------
+@app.context_processor
+def inject_base():
+    return dict(base_css=BASE_CSS, stripe=(stripe is not None))
 
-@app.route("/admin/category/<int:cid>", methods=["POST"])
-def admin_category_update(cid):
-    if not require_admin():
-        return redirect("/admin/login")
-    f = request.form
-    name = f.get("name", "")
-    sort_order = int(f.get("sort_order", "1") or 1)
-    active = 1 if f.get("active") == "1" else 0
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE categories
-        SET name=?, sort_order=?, active=?
-        WHERE id=?
-    """, (name, sort_order, active, cid))
-    conn.commit()
-    conn.close()
-    return redirect("/admin")
-
-
-@app.route("/admin/settings", methods=["POST"])
-def admin_settings_update():
-    if not require_admin():
-        return redirect("/admin/login")
-    f = request.form
-    keys = ["store_name", "hero_title", "hero_subtitle",
-            "primary_color", "accent_color", "image_height"]
-    for k in keys:
-        set_setting(k, f.get(k, ""))
-    return redirect("/admin")
-
-
-@app.route("/admin/payments", methods=["POST"])
-def admin_payments_update():
-    if not require_admin():
-        return redirect("/admin/login")
-    f = request.form
-    stripe_enabled = "1" if f.get("stripe_enabled") else "0"
-    vipps_enabled = "1" if f.get("vipps_enabled") else "0"
-    set_setting("stripe_enabled", stripe_enabled)
-    set_setting("vipps_enabled", vipps_enabled)
-    set_setting("stripe_public_key", f.get("stripe_public_key", ""))
-    set_setting("stripe_secret_key", f.get("stripe_secret_key", ""))
-    set_setting("vipps_merchant_key", f.get("vipps_merchant_key", ""))
-    return redirect("/admin")
-
-
-@app.route("/api/config")
-def api_config():
-    settings = get_settings([
-        "store_name",
-        "hero_title",
-        "hero_subtitle",
-        "primary_color",
-        "accent_color",
-        "image_height",
-        "stripe_enabled",
-        "vipps_enabled",
-        "stripe_public_key",
-    ])
-    return jsonify(settings)
-
-
-@app.route("/api/categories")
-def api_categories():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM categories WHERE active=1 ORDER BY sort_order ASC, id ASC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return jsonify(rows)
-
-
-@app.route("/api/products")
-def api_products():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE active=1 ORDER BY id ASC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return jsonify(rows)
-
-
-@app.route("/api/order/init", methods=["POST"])
-def api_order_init():
-    data = request.get_json() or {}
-    email = data.get("email")
-    amount = data.get("amount")
-    method = data.get("method", "INIT")
-    if not email or not amount or amount <= 0:
-        return jsonify({"error": "Ugyldige ordredata"}), 400
-    order_id = "ORD-" + datetime.now().strftime("%Y%m%d%H%M%S%f")
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO orders (id, email, amount, method, status, created)
-        VALUES (?,?,?,?,?,?)
-    """, (order_id, email, amount, method, "PENDING", datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True, "orderId": order_id})
-
-
-@app.route("/api/pay/vipps-init", methods=["POST"])
-def api_pay_vipps_init():
-    data = request.get_json() or {}
-    cart = data.get("cart", [])
-    email = data.get("email")
-    if not cart or not email:
-        return jsonify({"error": "Ugyldige data"}), 400
-
-    settings = get_settings(["vipps_enabled"])
-    if settings.get("vipps_enabled") != "1":
-        return jsonify({"error": "Vipps ikke aktivert"}), 400
-
-    amount = sum(item["price"] * item["qty"] for item in cart)
-    order_id = "ORD-" + datetime.now().strftime("%Y%m%d%H%M%S%f")
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO orders (id, email, amount, method, status, created)
-        VALUES (?,?,?,?,?,?)
-    """, (order_id, email, amount, "Vipps", "PENDING", datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-    # Her kan du senere koble til ekte Vipps-API
-    return jsonify({"ok": True, "orderId": order_id})
-
-
-@app.route("/api/pay/stripe-session", methods=["POST"])
-def api_pay_stripe_session():
-    data = request.get_json() or {}
-    cart = data.get("cart", [])
-    email = data.get("email")
-    if not cart or not email:
-        return jsonify({"error": "Ugyldige data"}), 400
-
-    settings = get_settings(["stripe_enabled", "stripe_secret_key", "stripe_public_key"])
-    if settings.get("stripe_enabled") != "1" or not settings.get("stripe_secret_key"):
-        return jsonify({"error": "Stripe ikke aktivert"}), 400
-
-    if stripe is None:
-        return jsonify({"error": "Stripe-biblioteket er ikke installert"}), 500
-
-    stripe.api_key = settings["stripe_secret_key"]
-    amount = sum(item["price"] * item["qty"] for item in cart)
-    order_id = "ORD-" + datetime.now().strftime("%Y%m%d%H%M%S%f")
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO orders (id, email, amount, method, status, created)
-        VALUES (?,?,?,?,?,?)
-    """, (order_id, email, amount, "Stripe", "PENDING", datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
-
-    try:
-        session_obj = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            mode="payment",
-            customer_email=email,
-            line_items=[
-                {
-                    "price_data": {
-                        "currency": "nok",
-                        "unit_amount": item["price"] * 100,
-                        "product_data": {"name": item["title"]},
-                    },
-                    "quantity": item["qty"],
-                }
-                for item in cart
-            ],
-            metadata={"orderId": order_id},
-            success_url=request.url_root.rstrip("/") + "/?success=1&orderId=" + order_id,
-            cancel_url=request.url_root.rstrip("/") + "/?canceled=1&orderId=" + order_id,
-        )
-        return jsonify({
-            "ok": True,
-            "sessionId": session_obj.id,
-            "publicKey": settings.get("stripe_public_key")
-        })
-    except Exception as e:
-        print("Stripe-feil:", e)
-        return jsonify({"error": "Stripe-feil"}), 500
-
-
-@app.route("/<path:filename>")
-def static_files(filename):
-    # serverer index.html og ev. andre filer hvis du legger dem i samme mappe
-    return send_from_directory(".", filename)
-
+# -------------------------
+# App startup
+# -------------------------
+init_db()
 
 if __name__ == "__main__":
-    init_db()
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
