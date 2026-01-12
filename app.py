@@ -207,6 +207,16 @@ def stripe_webhook():
     return "", 200
 
 # ---------- ADMIN OG TEMA ----------
+@app.route("/admin/upload", methods=["POST"])
+def upload_image():
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+    file = request.files["image"]
+    if file:
+        filename = secure_filename(file.filename)
+        file.save(os.path.join(UPLOAD_FOLDER, filename))
+    return redirect(url_for("admin"))
+
 @app.route("/admin", methods=["GET"])
 def admin():
     if not session.get("admin"):
